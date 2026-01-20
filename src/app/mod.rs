@@ -252,6 +252,7 @@ impl App {
                     if selected < self.state.queue.len() {
                         self.state.queue.set_current(selected);
                         if let Some(track) = self.state.queue.current_track().cloned() {
+                            self.state.playing_from_queue = true;
                             self.state.status = format!("Playing from queue: {}", track.title);
                             self.play_track(track, tx).await;
                         }
@@ -264,6 +265,7 @@ impl App {
                     // If playlist view is open, play the selected track
                     if self.state.playlist_view.is_open() {
                         if let Some(track) = self.state.playlist_view.selected_track().cloned() {
+                            self.state.playing_from_queue = false;
                             self.state.now_playing = Some(track.title.clone());
                             self.state.current_track = Some(track.clone());
                             self.state.status = "Resolving stream...".into();
@@ -285,6 +287,7 @@ impl App {
                         use crate::ytm::models::SearchItem;
                         match item {
                             SearchItem::Track(track) => {
+                                self.state.playing_from_queue = false;
                                 self.state.now_playing = Some(track.title.clone());
                                 self.state.current_track = Some(track.clone());
                                 self.state.status = "Resolving stream...".into();
@@ -314,6 +317,7 @@ impl App {
                 // "Activate" on a Track plays it (for History, Library Liked Songs)
                 let track = self.state.active_list().selected_track().cloned();
                 if let Some(track) = track {
+                    self.state.playing_from_queue = false;
                     self.state.now_playing = Some(track.title.clone());
                     self.state.current_track = Some(track.clone());
                     self.state.status = "Resolving stream...".into();
@@ -447,6 +451,7 @@ impl App {
                 if !self.state.queue.is_empty() {
                     if let Some(next_track) = self.state.queue.advance() {
                         let track = next_track.clone();
+                        self.state.playing_from_queue = true;
                         self.state.status = format!("Playing next: {}", track.title);
                         self.play_track(track, tx).await;
                     } else if self.state.repeat_mode == RepeatMode::All {
@@ -454,6 +459,7 @@ impl App {
                         self.state.queue.set_current(0);
                         if let Some(first_track) = self.state.queue.current_track() {
                             let track = first_track.clone();
+                            self.state.playing_from_queue = true;
                             self.state.status = format!("Restarting queue: {}", track.title);
                             self.play_track(track, tx).await;
                         }
@@ -468,6 +474,7 @@ impl App {
                 if !self.state.queue.is_empty() {
                     if let Some(prev_track) = self.state.queue.go_back() {
                         let track = prev_track.clone();
+                        self.state.playing_from_queue = true;
                         self.state.status = format!("Playing previous: {}", track.title);
                         self.play_track(track, tx).await;
                     } else {
@@ -1090,8 +1097,8 @@ impl App {
                     }
                 }
 
-                // Try to advance in the queue
-                if !self.state.queue.is_empty() {
+                // Only advance the queue if we were playing from it
+                if self.state.playing_from_queue && !self.state.queue.is_empty() {
                     if let Some(next_track) = self.state.queue.advance() {
                         let track = next_track.clone();
                         self.state.status = format!("Playing next: {}", track.title);

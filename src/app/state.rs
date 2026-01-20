@@ -520,6 +520,9 @@ pub struct AppState {
 
     // Status message (for debugging/info)
     pub status: String,
+
+    // Track whether current playback is from the queue (vs search/history/library)
+    pub playing_from_queue: bool,
 }
 
 impl Default for AppState {
@@ -567,6 +570,7 @@ impl AppState {
             repeat_mode: RepeatMode::default(),
             toast: None,
             status: String::new(),
+            playing_from_queue: false,
         }
     }
 
