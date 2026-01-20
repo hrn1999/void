@@ -64,11 +64,11 @@ pub struct UiConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let proj = ProjectDirs::from("dev", "kakariko", "kakariko");
+        let proj = ProjectDirs::from("dev", "void", "void");
         let data_dir = proj
             .as_ref()
             .map(|p| p.data_dir().to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir().join("kakariko"));
+            .unwrap_or_else(|| std::env::temp_dir().join("void"));
 
         Self {
             theme: Theme {
@@ -105,11 +105,11 @@ impl Default for InputConfig {
 
 impl Default for PathsConfig {
     fn default() -> Self {
-        let proj = ProjectDirs::from("dev", "kakariko", "kakariko");
+        let proj = ProjectDirs::from("dev", "void", "void");
         let data_dir = proj
             .as_ref()
             .map(|p| p.data_dir().to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir().join("kakariko"));
+            .unwrap_or_else(|| std::env::temp_dir().join("void"));
         Self { data_dir }
     }
 }
@@ -145,7 +145,7 @@ pub fn save(cfg: &Config, override_path: Option<&Path>) -> anyhow::Result<()> {
 
 pub fn default_config_path() -> anyhow::Result<PathBuf> {
     let proj =
-        ProjectDirs::from("dev", "kakariko", "kakariko").context("ProjectDirs unavailable")?;
+        ProjectDirs::from("dev", "void", "void").context("ProjectDirs unavailable")?;
     Ok(proj.config_dir().join("config.toml"))
 }
 

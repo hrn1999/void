@@ -40,6 +40,7 @@ pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
     let menu_items = [
         MenuItem::item(icons.history, "History"),
         MenuItem::item(icons.search, "Search"),
+        MenuItem::item(icons.queue, "Queue"),
         MenuItem::item(icons.library, "Library"),
         MenuItem::separator(),
         MenuItem::item(icons.settings, "Settings"),
@@ -47,9 +48,11 @@ pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
     ];
 
     // Map menu index to actual selection index (skipping separator)
-    let selection_to_menu: [usize; 5] = [0, 1, 2, 4, 5];
-    let menu_to_selection: [Option<usize>; 6] = [
-        Some(0), Some(1), Some(2), None, Some(3), Some(4)
+    // Menu indices: 0=History, 1=Search, 2=Queue, 3=Library, 4=separator, 5=Settings, 6=Help
+    // Selection indices: 0=History, 1=Search, 2=Queue, 3=Library, 4=Settings, 5=Help
+    let selection_to_menu: [usize; 6] = [0, 1, 2, 3, 5, 6];
+    let menu_to_selection: [Option<usize>; 7] = [
+        Some(0), Some(1), Some(2), Some(3), None, Some(4), Some(5)
     ];
 
     let items: Vec<ListItem> = menu_items
@@ -90,7 +93,7 @@ pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
         .collect();
 
     // Map selection to list position (account for separator)
-    let list_idx = selection_to_menu[state.sidebar_selected.min(4)];
+    let list_idx = selection_to_menu[state.sidebar_selected.min(5)];
 
     let mut list_state = ListState::default();
     list_state.select(Some(list_idx));

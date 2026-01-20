@@ -1,17 +1,17 @@
 //! Root layout widget - orchestrates main layout structure
 
-use crate::app::state::{AppState, Screen};
+use crate::app::state::{AppState, LibraryTab, Screen};
 use crate::config::Config;
 use crate::tui::theme::get_theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
 
-use super::{help, now_playing, settings, sidebar, track_list};
+use super::{help, now_playing, queue, settings, sidebar, track_list};
 
 /// Main layout structure:
 /// ┌──────────┬─────────────────────────────────────────┐
@@ -190,6 +190,7 @@ fn render_main_content(frame: &mut Frame, cfg: &Config, state: &mut AppState, ar
     let title = match state.screen {
         Screen::History => format!(" {} History ", icons.history),
         Screen::Search => format!(" {} Search ", icons.search),
+        Screen::Queue => format!(" {} Queue ", icons.queue),
         Screen::Library => format!(" {} Library ", icons.library),
         Screen::Settings => format!(" {} Settings ", icons.settings),
         Screen::Help => format!(" {} Keybinds ", icons.help),
@@ -213,14 +214,288 @@ fn render_main_content(frame: &mut Frame, cfg: &Config, state: &mut AppState, ar
             track_list::render_search_box(frame, state, sub[0]);
             track_list::render(frame, cfg, state, sub[1]);
         }
+        Screen::Queue => {
+            queue::render(frame, state, inner);
+        }
         Screen::Settings => {
             settings::render(frame, cfg, state, inner);
         }
-        Screen::History | Screen::Library => {
+        Screen::History => {
             track_list::render(frame, cfg, state, inner);
+        }
+        Screen::Library => {
+            render_library_with_tabs(frame, cfg, state, inner);
         }
         Screen::Help => {
             help::render(frame, state, inner);
+        }
+    }
+}
+
+/// Render the library screen with tabs for Liked Songs, Playlists, Albums
+fn render_library_with_tabs(frame: &mut Frame, cfg: &Config, state: &mut AppState, area: Rect) {
+    let theme = get_theme();
+
+    // Split into tabs bar and content
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(3)])
+        .split(area);
+
+    // Render tabs
+    let tabs = [
+        ("Liked Songs", LibraryTab::LikedSongs),
+        ("Playlists", LibraryTab::Playlists),
+        ("Albums", LibraryTab::Albums),
+    ];
+
+    let tab_spans: Vec<Span> = tabs
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (label, tab))| {
+            let is_selected = state.library_tab == *tab;
+            let style = if is_selected {
+                Style::default()
+                    .fg(theme.palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.palette.fg_secondary)
+            };
+
+            let bracket_style = if is_selected {
+                Style::default().fg(theme.palette.accent)
+            } else {
+                Style::default().fg(theme.palette.fg_secondary)
+            };
+
+            let mut spans = vec![
+                Span::styled("[", bracket_style),
+                Span::styled(*label, style),
+                Span::styled("]", bracket_style),
+            ];
+
+            if i < tabs.len() - 1 {
+                spans.push(Span::raw("  "));
+            }
+            spans
+        })
+        .collect();
+
+    let tabs_line = Line::from(tab_spans);
+    let tabs_paragraph = Paragraph::new(tabs_line);
+    frame.render_widget(tabs_paragraph, layout[0]);
+
+    // Render content based on selected tab
+    match state.library_tab {
+        LibraryTab::LikedSongs => {
+            track_list::render(frame, cfg, state, layout[1]);
+        }
+        LibraryTab::Playlists => {
+            render_playlists_list(frame, state, layout[1]);
+        }
+        LibraryTab::Albums => {
+            render_albums_placeholder(frame, layout[1]);
+        }
+    }
+}
+
+/// Render the playlists list in the Library
+fn render_playlists_list(frame: &mut Frame, state: &AppState, area: Rect) {
+    // If playlist view is open, render that instead
+    if state.playlist_view.is_open() {
+        render_playlist_tracks_view(frame, state, area);
+        return;
+    }
+
+    let theme = get_theme();
+    let icons = &theme.icons;
+
+    let playlist_state = &state.playlist_list;
+
+    if playlist_state.loading {
+        let spinner = crate::tui::theme::LoadingSpinner::frame(state.tick);
+        let loading = Paragraph::new(Line::from(format!("{} Loading playlists...", spinner)))
+            .style(Style::default().fg(theme.palette.fg_secondary));
+        frame.render_widget(loading, area);
+        return;
+    }
+
+    if playlist_state.playlists.is_empty() {
+        let msg = if playlist_state.loaded {
+            "No playlists found. Create some on YouTube Music!"
+        } else {
+            "Press Tab to load playlists (requires authentication)"
+        };
+        let empty = Paragraph::new(Line::from(msg))
+            .style(Style::default().fg(theme.palette.fg_secondary));
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let visible_height = area.height as usize;
+    let scroll_offset = playlist_state.scroll_offset;
+
+    let items: Vec<ListItem> = playlist_state
+        .playlists
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|(i, playlist)| {
+            let is_selected = i == playlist_state.selected;
+
+            let style = if is_selected {
+                Style::default()
+                    .fg(theme.palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.palette.fg_primary)
+            };
+
+            let track_count = playlist
+                .track_count
+                .map(|c| format!(" ({} tracks)", c))
+                .unwrap_or_default();
+
+            let display = format!("{} {}{}", icons.playlist, playlist.title, track_count);
+
+            ListItem::new(Line::from(Span::styled(display, style)))
+        })
+        .collect();
+
+    let adjusted_selected = playlist_state.selected.saturating_sub(scroll_offset);
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(adjusted_selected));
+
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(theme.palette.bg_primary)
+                .bg(theme.palette.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("\u{f054} ");
+
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Placeholder for albums list
+fn render_albums_placeholder(frame: &mut Frame, area: Rect) {
+    let theme = get_theme();
+    let msg = "Albums tab coming soon...";
+    let placeholder = Paragraph::new(Line::from(msg))
+        .style(Style::default().fg(theme.palette.fg_secondary));
+    frame.render_widget(placeholder, area);
+}
+
+/// Render the tracks within an opened playlist
+fn render_playlist_tracks_view(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = get_theme();
+    let icons = &theme.icons;
+    let view = &state.playlist_view;
+
+    // Header with back hint and playlist name
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(3)])
+        .split(area);
+
+    let playlist_name = view
+        .playlist
+        .as_ref()
+        .map(|p| p.title.as_str())
+        .unwrap_or("Unknown Playlist");
+
+    let track_count = view.tracks.len();
+
+    let header = Line::from(vec![
+        Span::styled("← ", Style::default().fg(theme.palette.fg_secondary)),
+        Span::styled("Esc/Backspace", Style::default().fg(theme.palette.accent)),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("\"{}\" ({} tracks)", playlist_name, track_count),
+            Style::default()
+                .fg(theme.palette.fg_primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(header), layout[0]);
+
+    // Loading state
+    if view.loading {
+        let spinner = crate::tui::theme::LoadingSpinner::frame(state.tick);
+        let loading = Paragraph::new(Line::from(format!("{} Loading tracks...", spinner)))
+            .style(Style::default().fg(theme.palette.fg_secondary));
+        frame.render_widget(loading, layout[1]);
+        return;
+    }
+
+    // Empty state
+    if view.tracks.is_empty() {
+        let empty = Paragraph::new(Line::from("This playlist is empty"))
+            .style(Style::default().fg(theme.palette.fg_secondary));
+        frame.render_widget(empty, layout[1]);
+        return;
+    }
+
+    // Track list
+    let visible_height = layout[1].height as usize;
+    let scroll_offset = view.scroll_offset;
+
+    let items: Vec<ListItem> = view
+        .tracks
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|(i, track)| {
+            let is_selected = i == view.selected;
+
+            let style = if is_selected {
+                Style::default()
+                    .fg(theme.palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.palette.fg_primary)
+            };
+
+            let artists = if track.artists.is_empty() {
+                String::new()
+            } else {
+                format!(" - {}", track.artists.join(", "))
+            };
+
+            let display = format!("{} {}{}", icons.music, track.title, artists);
+
+            ListItem::new(Line::from(Span::styled(display, style)))
+        })
+        .collect();
+
+    let adjusted_selected = view.selected.saturating_sub(scroll_offset);
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(adjusted_selected));
+
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(theme.palette.bg_primary)
+                .bg(theme.palette.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("\u{f054} ");
+
+    frame.render_stateful_widget(list, layout[1], &mut list_state);
+
+    // Scroll position indicator
+    if view.tracks.len() > visible_height {
+        let pos_text = format!("{}/{}", view.selected + 1, view.tracks.len());
+        let pos_len = pos_text.len() as u16;
+        let pos_x = layout[1].x + layout[1].width.saturating_sub(pos_len);
+        if pos_x > layout[1].x {
+            frame.render_widget(
+                Paragraph::new(pos_text).style(Style::default().fg(theme.palette.fg_secondary)),
+                Rect::new(pos_x, layout[1].y, pos_len, 1),
+            );
         }
     }
 }

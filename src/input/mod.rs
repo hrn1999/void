@@ -86,6 +86,14 @@ fn handle_normal_mode(state: &AppState, k: crossterm::event::KeyEvent) -> Option
         return handle_settings_screen(state, k);
     }
 
+    if state.screen == Screen::Queue {
+        return handle_queue_screen(k);
+    }
+
+    if state.screen == Screen::Library {
+        return handle_library_screen(state, k);
+    }
+
     match k.code {
         // Quit
         KeyCode::Char('q') => Some(Action::Quit),
@@ -108,9 +116,17 @@ fn handle_normal_mode(state: &AppState, k: crossterm::event::KeyEvent) -> Option
         KeyCode::BackTab => Some(Action::PrevScreen),
         KeyCode::Char('1') => Some(Action::SetScreen(Screen::History)),
         KeyCode::Char('2') => Some(Action::SetScreen(Screen::Search)),
-        KeyCode::Char('3') => Some(Action::SetScreen(Screen::Library)),
-        KeyCode::Char('4') => Some(Action::SetScreen(Screen::Settings)),
-        KeyCode::Char('5') => Some(Action::SetScreen(Screen::Help)),
+        KeyCode::Char('3') => Some(Action::SetScreen(Screen::Queue)),
+        KeyCode::Char('4') => Some(Action::SetScreen(Screen::Library)),
+        KeyCode::Char('5') => Some(Action::SetScreen(Screen::Settings)),
+        KeyCode::Char('6') => Some(Action::SetScreen(Screen::Help)),
+
+        // Quick queue access
+        KeyCode::Char('Q') => Some(Action::SetScreen(Screen::Queue)),
+
+        // Playback navigation
+        KeyCode::Char('n') => Some(Action::PlayNext),
+        KeyCode::Char('p') => Some(Action::PlayPrev),
 
         // Playback
         KeyCode::Char(' ') => Some(Action::TogglePause),
@@ -150,8 +166,9 @@ fn handle_settings_screen(state: &AppState, k: crossterm::event::KeyEvent) -> Op
         // Direct screen switching
         KeyCode::Char('1') => Some(Action::SetScreen(Screen::History)),
         KeyCode::Char('2') => Some(Action::SetScreen(Screen::Search)),
-        KeyCode::Char('3') => Some(Action::SetScreen(Screen::Library)),
-        KeyCode::Char('5') => Some(Action::SetScreen(Screen::Help)),
+        KeyCode::Char('3') => Some(Action::SetScreen(Screen::Queue)),
+        KeyCode::Char('4') => Some(Action::SetScreen(Screen::Library)),
+        KeyCode::Char('6') => Some(Action::SetScreen(Screen::Help)),
 
         // Playback
         KeyCode::Char(' ') => Some(Action::TogglePause),
@@ -201,5 +218,145 @@ fn handle_search_screen_normal(state: &AppState, k: crossterm::event::KeyEvent) 
             }
         }
         SearchFocus::Results => handle_search_results(k),
+    }
+}
+
+fn handle_library_screen(state: &AppState, k: crossterm::event::KeyEvent) -> Option<Action> {
+    // If playlist view is open, handle navigation within it
+    if state.playlist_view.is_open() {
+        return handle_playlist_view(k);
+    }
+
+    match k.code {
+        // Quit
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Esc => Some(Action::Quit),
+
+        // Tab switching within Library
+        KeyCode::Tab => Some(Action::LibraryTabNext),
+        KeyCode::BackTab => Some(Action::LibraryTabPrev),
+
+        // Navigation
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::ListUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::ListDown),
+        KeyCode::Char('g') => Some(Action::GoTop),
+        KeyCode::Char('G') => Some(Action::GoBottom),
+        KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::PageDown),
+        KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::PageUp),
+
+        // Sidebar navigation
+        KeyCode::Left | KeyCode::Char('h') => Some(Action::SidebarUp),
+        KeyCode::Right | KeyCode::Char('l') => Some(Action::SidebarDown),
+
+        // Screen switching
+        KeyCode::Char('1') => Some(Action::SetScreen(Screen::History)),
+        KeyCode::Char('2') => Some(Action::SetScreen(Screen::Search)),
+        KeyCode::Char('3') => Some(Action::SetScreen(Screen::Queue)),
+        KeyCode::Char('5') => Some(Action::SetScreen(Screen::Settings)),
+        KeyCode::Char('6') => Some(Action::SetScreen(Screen::Help)),
+
+        // Playback
+        KeyCode::Char(' ') => Some(Action::TogglePause),
+        KeyCode::Char('=') | KeyCode::Char('+') => Some(Action::VolumeUp),
+        KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::VolumeDown),
+        KeyCode::Char(']') => Some(Action::SeekForward),
+        KeyCode::Char('[') => Some(Action::SeekBack),
+        KeyCode::Char('R') => Some(Action::ToggleRepeatMode),
+        KeyCode::Char('n') => Some(Action::PlayNext),
+        KeyCode::Char('p') => Some(Action::PlayPrev),
+        KeyCode::Char('Q') => Some(Action::SetScreen(Screen::Queue)),
+
+        // Actions
+        KeyCode::Enter => Some(Action::Activate),
+        KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Refresh),
+        KeyCode::F(5) => Some(Action::Refresh),
+        KeyCode::Char('?') | KeyCode::F(1) => Some(Action::SetScreen(Screen::Help)),
+
+        _ => None,
+    }
+}
+
+fn handle_playlist_view(k: crossterm::event::KeyEvent) -> Option<Action> {
+    match k.code {
+        // Close playlist view
+        KeyCode::Esc | KeyCode::Backspace => Some(Action::ClosePlaylist),
+
+        // Navigation
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::ListUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::ListDown),
+        KeyCode::Char('g') => Some(Action::GoTop),
+        KeyCode::Char('G') => Some(Action::GoBottom),
+        KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::PageDown),
+        KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::PageUp),
+
+        // Playback
+        KeyCode::Char(' ') => Some(Action::TogglePause),
+        KeyCode::Char('=') | KeyCode::Char('+') => Some(Action::VolumeUp),
+        KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::VolumeDown),
+        KeyCode::Char('n') => Some(Action::PlayNext),
+        KeyCode::Char('p') => Some(Action::PlayPrev),
+
+        // Play selected track
+        KeyCode::Enter => Some(Action::Activate),
+
+        // Add to queue
+        KeyCode::Char('a') => Some(Action::AddSelectedToQueue),
+        KeyCode::Char('A') => Some(Action::AddAllToQueue),
+
+        // Quick quit
+        KeyCode::Char('q') => Some(Action::Quit),
+
+        _ => None,
+    }
+}
+
+fn handle_queue_screen(k: crossterm::event::KeyEvent) -> Option<Action> {
+    match k.code {
+        // Quit
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Esc => Some(Action::Quit),
+
+        // Navigation
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::ListUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::ListDown),
+        KeyCode::Char('g') => Some(Action::GoTop),
+        KeyCode::Char('G') => Some(Action::GoBottom),
+        KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::PageDown),
+        KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::PageUp),
+
+        // Sidebar navigation
+        KeyCode::Left | KeyCode::Char('h') => Some(Action::SidebarUp),
+        KeyCode::Right | KeyCode::Char('l') => Some(Action::SidebarDown),
+
+        // Screen switching
+        KeyCode::Tab => Some(Action::NextScreen),
+        KeyCode::BackTab => Some(Action::PrevScreen),
+        KeyCode::Char('1') => Some(Action::SetScreen(Screen::History)),
+        KeyCode::Char('2') => Some(Action::SetScreen(Screen::Search)),
+        KeyCode::Char('4') => Some(Action::SetScreen(Screen::Library)),
+        KeyCode::Char('5') => Some(Action::SetScreen(Screen::Settings)),
+        KeyCode::Char('6') => Some(Action::SetScreen(Screen::Help)),
+
+        // Playback
+        KeyCode::Char(' ') => Some(Action::TogglePause),
+        KeyCode::Char('=') | KeyCode::Char('+') => Some(Action::VolumeUp),
+        KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::VolumeDown),
+        KeyCode::Char(']') => Some(Action::SeekForward),
+        KeyCode::Char('[') => Some(Action::SeekBack),
+        KeyCode::Char('R') => Some(Action::ToggleRepeatMode),
+
+        // Queue-specific actions
+        KeyCode::Enter => Some(Action::Activate), // Play selected track
+        KeyCode::Char('d') | KeyCode::Delete => Some(Action::QueueRemove(0)), // Will use selected index
+        KeyCode::Char('c') => Some(Action::QueueClear),
+        KeyCode::Char('s') => Some(Action::QueueShuffle),
+        KeyCode::Char('K') => Some(Action::QueueMoveUp),   // Shift+K to move up
+        KeyCode::Char('J') => Some(Action::QueueMoveDown), // Shift+J to move down
+        KeyCode::Char('n') => Some(Action::PlayNext),
+        KeyCode::Char('p') => Some(Action::PlayPrev),
+
+        KeyCode::Char('?') | KeyCode::F(1) => Some(Action::SetScreen(Screen::Help)),
+
+        _ => None,
     }
 }

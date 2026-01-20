@@ -36,7 +36,7 @@ pub struct LrclibClient {
 
 impl LrclibClient {
     const DEFAULT_BASE_URL: &'static str = "https://lrclib.net/api";
-    const USER_AGENT: &'static str = "Kakariko/0.1.0 (https://github.com/kakariko)";
+    const USER_AGENT: &'static str = "Void/0.1.0 (https://github.com/void)";
 
     /// Create a new LRCLIB client
     pub fn new() -> Self {

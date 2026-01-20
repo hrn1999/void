@@ -10,7 +10,7 @@ use crate::player::mpv::MpvHandle;
 use crate::ytm::{self, api::YtmClient};
 use actions::Action;
 use events::Event;
-use state::{AppState, RepeatMode, Screen, SearchFocus, SettingsFocus, Toast};
+use state::{AppState, LibraryTab, RepeatMode, Screen, SearchFocus, SettingsFocus, Toast};
 use tokio::sync::mpsc;
 
 pub struct App {
@@ -41,6 +41,7 @@ impl App {
             state.screen = match screen_name.as_str() {
                 "history" => Screen::History,
                 "search" => Screen::Search,
+                "queue" => Screen::Queue,
                 "library" => Screen::Library,
                 "settings" => Screen::Settings,
                 "help" => Screen::Help,
@@ -134,6 +135,7 @@ impl App {
         let screen_name = match self.state.screen {
             Screen::History => "history",
             Screen::Search => "search",
+            Screen::Queue => "queue",
             Screen::Library => "library",
             Screen::Settings => "settings",
             Screen::Help => "help",
@@ -244,7 +246,72 @@ impl App {
                 self.clear_cache();
             }
             Action::Activate => {
-                // "Activate" on a Track plays it
+                // On Queue screen, play the selected track from the queue
+                if self.state.screen == Screen::Queue {
+                    let selected = self.state.queue_list.selected;
+                    if selected < self.state.queue.len() {
+                        self.state.queue.set_current(selected);
+                        if let Some(track) = self.state.queue.current_track().cloned() {
+                            self.state.status = format!("Playing from queue: {}", track.title);
+                            self.play_track(track, tx).await;
+                        }
+                    }
+                    return;
+                }
+
+                // On Library screen with Playlists tab
+                if self.state.screen == Screen::Library && self.state.library_tab == LibraryTab::Playlists {
+                    // If playlist view is open, play the selected track
+                    if self.state.playlist_view.is_open() {
+                        if let Some(track) = self.state.playlist_view.selected_track().cloned() {
+                            self.state.now_playing = Some(track.title.clone());
+                            self.state.current_track = Some(track.clone());
+                            self.state.status = "Resolving stream...".into();
+                            self.play_track(track, tx).await;
+                        }
+                        return;
+                    }
+                    // Otherwise open the selected playlist
+                    if let Some(playlist) = self.state.playlist_list.selected_playlist().cloned() {
+                        self.state.playlist_view.open(playlist.clone());
+                        self.spawn_load_playlist_tracks(&playlist.id, tx);
+                    }
+                    return;
+                }
+
+                // On Search screen, handle both tracks and playlists
+                if self.state.screen == Screen::Search {
+                    if let Some(item) = self.state.search_list.selected_search_item().cloned() {
+                        use crate::ytm::models::SearchItem;
+                        match item {
+                            SearchItem::Track(track) => {
+                                self.state.now_playing = Some(track.title.clone());
+                                self.state.current_track = Some(track.clone());
+                                self.state.status = "Resolving stream...".into();
+                                self.play_track(track, tx).await;
+                            }
+                            SearchItem::Playlist(playlist) => {
+                                // Open playlist view and switch to Library screen
+                                let playlist_model = crate::ytm::models::Playlist {
+                                    id: playlist.id,
+                                    title: playlist.title,
+                                    author: playlist.author,
+                                    track_count: playlist.track_count,
+                                    thumbnail_url: playlist.thumbnail_url,
+                                };
+                                self.state.playlist_view.open(playlist_model.clone());
+                                self.spawn_load_playlist_tracks(&playlist_model.id, tx);
+                                // Switch to Library with Playlists tab
+                                self.state.screen = Screen::Library;
+                                self.state.sidebar_selected = screen_to_sidebar(Screen::Library);
+                                self.state.library_tab = LibraryTab::Playlists;
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                // "Activate" on a Track plays it (for History, Library Liked Songs)
                 let track = self.state.active_list().selected_track().cloned();
                 if let Some(track) = track {
                     self.state.now_playing = Some(track.title.clone());
@@ -376,6 +443,61 @@ impl App {
                     let _ = mpv.seek_relative(-10.0).await;
                 }
             }
+            Action::PlayNext => {
+                if !self.state.queue.is_empty() {
+                    if let Some(next_track) = self.state.queue.advance() {
+                        let track = next_track.clone();
+                        self.state.status = format!("Playing next: {}", track.title);
+                        self.play_track(track, tx).await;
+                    } else if self.state.repeat_mode == RepeatMode::All {
+                        // At end of queue with Repeat All - go back to start
+                        self.state.queue.set_current(0);
+                        if let Some(first_track) = self.state.queue.current_track() {
+                            let track = first_track.clone();
+                            self.state.status = format!("Restarting queue: {}", track.title);
+                            self.play_track(track, tx).await;
+                        }
+                    } else {
+                        self.state.toast = Some(Toast::error("End of queue"));
+                    }
+                } else {
+                    self.state.toast = Some(Toast::error("Queue is empty"));
+                }
+            }
+            Action::PlayPrev => {
+                if !self.state.queue.is_empty() {
+                    if let Some(prev_track) = self.state.queue.go_back() {
+                        let track = prev_track.clone();
+                        self.state.status = format!("Playing previous: {}", track.title);
+                        self.play_track(track, tx).await;
+                    } else {
+                        self.state.toast = Some(Toast::error("Start of queue"));
+                    }
+                } else {
+                    self.state.toast = Some(Toast::error("Queue is empty"));
+                }
+            }
+            Action::LibraryTabNext => {
+                self.state.library_tab = self.state.library_tab.next();
+                // Load playlists if switching to Playlists tab
+                if self.state.library_tab == LibraryTab::Playlists {
+                    self.spawn_load_playlists(tx);
+                }
+            }
+            Action::LibraryTabPrev => {
+                self.state.library_tab = self.state.library_tab.prev();
+                // Load playlists if switching to Playlists tab
+                if self.state.library_tab == LibraryTab::Playlists {
+                    self.spawn_load_playlists(tx);
+                }
+            }
+            Action::LoadPlaylists => {
+                self.spawn_load_playlists(tx);
+            }
+            Action::OpenPlaylist(playlist) => {
+                self.state.playlist_view.open(playlist.clone());
+                self.spawn_load_playlist_tracks(&playlist.id, tx);
+            }
             _ => self.reduce(action),
         }
     }
@@ -395,45 +517,16 @@ impl App {
         self.state.status = format!("Searching: {query}");
 
         let ytm = self.ytm.clone();
-        let storage = self.storage_cache_handle();
         let tx = tx.clone();
 
         tokio::spawn(async move {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-
-            // Cache hit (freshness policy can be refined later)
-            if let Ok(Ok(Some((json, _ts)))) = tokio::task::spawn_blocking({
-                let storage = storage.clone();
-                let query = query.clone();
-                move || storage.get_cached_search(&query)
-            })
-            .await
-                && let Ok(tracks) = serde_json::from_str::<Vec<crate::ytm::models::Track>>(&json) {
-                    let _ = tx
-                        .send(Event::Network(
-                            crate::app::events::NetworkEvent::SearchResults { query, tracks, continuation: None },
-                        ))
-                        .await;
-                    return;
-                }
-
-            match ytm.search_with_continuation(&query).await {
+            // Use search_all to get both tracks and playlists
+            match ytm.search_all(&query).await {
                 Ok(result) => {
-                    if let Ok(raw) = serde_json::to_string(&result.tracks) {
-                        let _ = tokio::task::spawn_blocking({
-                            let storage = storage.clone();
-                            let query = query.clone();
-                            move || storage.cache_search(&query, &raw, now)
-                        })
-                        .await;
-                    }
                     let _ = tx
                         .send(Event::Network(crate::app::events::NetworkEvent::SearchResults {
                             query,
-                            tracks: result.tracks,
+                            items: result.items,
                             continuation: result.continuation,
                         }))
                         .await;
@@ -467,9 +560,15 @@ impl App {
         tokio::spawn(async move {
             match ytm.search_continue(&continuation).await {
                 Ok(result) => {
+                    // Convert tracks to SearchItems (continuation only returns tracks)
+                    let items: Vec<crate::ytm::models::SearchItem> = result
+                        .tracks
+                        .into_iter()
+                        .map(crate::ytm::models::SearchItem::Track)
+                        .collect();
                     let _ = tx
                         .send(Event::Network(crate::app::events::NetworkEvent::SearchMoreResults {
-                            tracks: result.tracks,
+                            items,
                             continuation: result.continuation,
                         }))
                         .await;
@@ -543,6 +642,63 @@ impl App {
                     let _ = tx
                         .send(Event::Network(crate::app::events::NetworkEvent::Error(
                             format!("Library: {e:#}"),
+                        )))
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn spawn_load_playlists(&mut self, tx: &mpsc::Sender<Event>) {
+        if self.state.playlist_list.loading || self.state.playlist_list.loaded {
+            return;
+        }
+        self.state.playlist_list.loading = true;
+        self.state.status = "Loading playlists...".into();
+
+        let ytm = self.ytm.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            match ytm.get_user_playlists().await {
+                Ok(playlists) => {
+                    let _ = tx
+                        .send(Event::Network(crate::app::events::NetworkEvent::PlaylistsLoaded {
+                            playlists,
+                        }))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Event::Network(crate::app::events::NetworkEvent::Error(
+                            format!("Playlists: {e:#}"),
+                        )))
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn spawn_load_playlist_tracks(&mut self, playlist_id: &str, tx: &mpsc::Sender<Event>) {
+        self.state.playlist_view.loading = true;
+        self.state.status = "Loading playlist tracks...".into();
+
+        let ytm = self.ytm.clone();
+        let tx = tx.clone();
+        let playlist_id = playlist_id.to_string();
+        tokio::spawn(async move {
+            match ytm.browse_playlist_tracks(&playlist_id).await {
+                Ok(tracks) => {
+                    let _ = tx
+                        .send(Event::Network(crate::app::events::NetworkEvent::PlaylistTracksLoaded {
+                            _playlist_id: playlist_id,
+                            tracks,
+                        }))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Event::Network(crate::app::events::NetworkEvent::Error(
+                            format!("Playlist tracks: {e:#}"),
                         )))
                         .await;
                 }
@@ -645,6 +801,17 @@ impl App {
                         }
                         SettingsFocus::Cache => {}
                     }
+                } else if self.state.screen == Screen::Queue {
+                    self.state.queue_list.select_prev();
+                    self.state.queue_list.update_scroll(20);
+                } else if self.state.screen == Screen::Library && self.state.library_tab == LibraryTab::Playlists {
+                    if self.state.playlist_view.is_open() {
+                        self.state.playlist_view.select_prev();
+                        self.state.playlist_view.update_scroll(20);
+                    } else {
+                        self.state.playlist_list.select_prev();
+                        self.state.playlist_list.update_scroll(20);
+                    }
                 } else {
                     let list = self.state.active_list_mut();
                     list.select_prev();
@@ -664,6 +831,18 @@ impl App {
                         }
                         SettingsFocus::Cache => {}
                     }
+                } else if self.state.screen == Screen::Queue {
+                    let len = self.state.queue.len();
+                    self.state.queue_list.select_next(len);
+                    self.state.queue_list.update_scroll(20);
+                } else if self.state.screen == Screen::Library && self.state.library_tab == LibraryTab::Playlists {
+                    if self.state.playlist_view.is_open() {
+                        self.state.playlist_view.select_next();
+                        self.state.playlist_view.update_scroll(20);
+                    } else {
+                        self.state.playlist_list.select_next();
+                        self.state.playlist_list.update_scroll(20);
+                    }
                 } else {
                     let list = self.state.active_list_mut();
                     list.select_next();
@@ -677,6 +856,9 @@ impl App {
                         SettingsFocus::AudioDevice => self.state.audio_selected = 0,
                         SettingsFocus::Cache => {}
                     }
+                } else if self.state.screen == Screen::Queue {
+                    self.state.queue_list.selected = 0;
+                    self.state.queue_list.scroll_offset = 0;
                 } else {
                     let list = self.state.active_list_mut();
                     list.selected = 0;
@@ -694,6 +876,9 @@ impl App {
                         }
                         SettingsFocus::Cache => {}
                     }
+                } else if self.state.screen == Screen::Queue {
+                    self.state.queue_list.selected = self.state.queue.len().saturating_sub(1);
+                    self.state.queue_list.update_scroll(20);
                 } else {
                     let list = self.state.active_list_mut();
                     list.selected = list.items.len().saturating_sub(1);
@@ -711,6 +896,9 @@ impl App {
                         }
                         SettingsFocus::Cache => {}
                     }
+                } else if self.state.screen == Screen::Queue {
+                    self.state.queue_list.selected = self.state.queue_list.selected.saturating_sub(10);
+                    self.state.queue_list.update_scroll(20);
                 } else {
                     let list = self.state.active_list_mut();
                     list.selected = list.selected.saturating_sub(10);
@@ -730,6 +918,10 @@ impl App {
                         }
                         SettingsFocus::Cache => {}
                     }
+                } else if self.state.screen == Screen::Queue {
+                    let len = self.state.queue.len();
+                    self.state.queue_list.selected = (self.state.queue_list.selected + 10).min(len.saturating_sub(1));
+                    self.state.queue_list.update_scroll(20);
                 } else {
                     let list = self.state.active_list_mut();
                     list.selected = (list.selected + 10).min(list.items.len().saturating_sub(1));
@@ -777,6 +969,102 @@ impl App {
             Action::SettingsFocusNext => {} // Handled in handle_action
             Action::SettingsFocusPrev => {} // Handled in handle_action
             Action::ClearCache => {} // Handled in handle_action
+
+            // Queue actions
+            Action::QueueAdd(track) => {
+                self.state.queue.add(track);
+            }
+            Action::QueueAddMany(tracks) => {
+                self.state.queue.add_many(tracks);
+            }
+            Action::QueueReplace(tracks) => {
+                self.state.queue.replace(tracks);
+            }
+            Action::QueueRemove(_) => {
+                // Remove the currently selected track in the queue view
+                let selected = self.state.queue_list.selected;
+                if selected < self.state.queue.len() {
+                    self.state.queue.remove(selected);
+                    // Adjust selection if needed
+                    if self.state.queue_list.selected >= self.state.queue.len() && !self.state.queue.is_empty() {
+                        self.state.queue_list.selected = self.state.queue.len() - 1;
+                    }
+                }
+            }
+            Action::QueueClear => {
+                self.state.queue.clear();
+                self.state.toast = Some(Toast::success("Queue cleared"));
+            }
+            Action::QueueShuffle => {
+                self.state.queue.toggle_shuffle();
+                let status = if self.state.queue.is_shuffle_enabled() {
+                    "Shuffle enabled"
+                } else {
+                    "Shuffle disabled"
+                };
+                self.state.toast = Some(Toast::success(status));
+            }
+            Action::QueueMoveUp => {
+                if self.state.screen == Screen::Queue {
+                    let selected = self.state.queue_list.selected;
+                    if selected > 0 {
+                        self.state.queue.move_track(selected, selected - 1);
+                        self.state.queue_list.selected = selected - 1;
+                    }
+                }
+            }
+            Action::QueueMoveDown => {
+                if self.state.screen == Screen::Queue {
+                    let selected = self.state.queue_list.selected;
+                    if selected + 1 < self.state.queue.len() {
+                        self.state.queue.move_track(selected, selected + 1);
+                        self.state.queue_list.selected = selected + 1;
+                    }
+                }
+            }
+            Action::QueuePlayIndex(index) => {
+                self.state.queue.set_current(index);
+            }
+            Action::PlayNext => {} // Handled in handle_action
+            Action::PlayPrev => {} // Handled in handle_action
+            Action::AddSelectedToQueue => {
+                // Add currently selected track to queue
+                if self.state.screen == Screen::Library
+                    && self.state.library_tab == LibraryTab::Playlists
+                    && self.state.playlist_view.is_open()
+                {
+                    if let Some(track) = self.state.playlist_view.selected_track().cloned() {
+                        self.state.queue.add(track.clone());
+                        self.state.toast = Some(Toast::success(format!("Added to queue: {}", track.title)));
+                    }
+                } else if let Some(track) = self.state.active_list().selected_track().cloned() {
+                    self.state.queue.add(track.clone());
+                    self.state.toast = Some(Toast::success(format!("Added to queue: {}", track.title)));
+                }
+            }
+            Action::AddAllToQueue => {
+                // Add all tracks from playlist view to queue
+                if self.state.screen == Screen::Library
+                    && self.state.library_tab == LibraryTab::Playlists
+                    && self.state.playlist_view.is_open()
+                {
+                    let tracks = self.state.playlist_view.tracks.clone();
+                    let count = tracks.len();
+                    self.state.queue.add_many(tracks);
+                    self.state.toast = Some(Toast::success(format!("Added {} tracks to queue", count)));
+                }
+            }
+
+            // Library tab actions - all handled in handle_action for async loading
+            Action::LibraryTabNext => {}
+            Action::LibraryTabPrev => {}
+            Action::LoadPlaylists => {}
+            Action::OpenPlaylist(_) => {}
+            Action::ClosePlaylist => {
+                self.state.playlist_view.close();
+            }
+
+            Action::TrackEnded => {} // Handled in handle_action
         }
     }
 
@@ -792,13 +1080,32 @@ impl App {
                 self.state.position_secs = 0.0;
                 self.state.duration_secs = 0.0;
 
-                // Handle repeat mode
+                // Handle repeat mode: One
                 if self.state.repeat_mode == RepeatMode::One {
                     // Repeat current track
                     if let Some(track) = self.state.current_track.clone() {
                         self.state.status = format!("Repeating: {}", track.title);
                         self.play_track(track, tx).await;
                         return;
+                    }
+                }
+
+                // Try to advance in the queue
+                if !self.state.queue.is_empty() {
+                    if let Some(next_track) = self.state.queue.advance() {
+                        let track = next_track.clone();
+                        self.state.status = format!("Playing next: {}", track.title);
+                        self.play_track(track, tx).await;
+                        return;
+                    } else if self.state.repeat_mode == RepeatMode::All {
+                        // At end of queue with Repeat All - go back to start
+                        self.state.queue.set_current(0);
+                        if let Some(first_track) = self.state.queue.current_track() {
+                            let track = first_track.clone();
+                            self.state.status = format!("Restarting queue: {}", track.title);
+                            self.play_track(track, tx).await;
+                            return;
+                        }
                     }
                 }
 
@@ -816,12 +1123,14 @@ impl App {
                 self.state.search_list.loading = false;
                 self.state.search_list.loading_more = false;
                 self.state.library_list.loading = false;
+                self.state.playlist_list.loading = false;
+                self.state.playlist_view.loading = false;
                 self.state.toast = Some(Toast::error(e.clone()));
                 self.state.status = format!("Error: {e} (press r to retry)");
             }
-            crate::app::events::NetworkEvent::SearchResults { query, tracks, continuation } => {
+            crate::app::events::NetworkEvent::SearchResults { query, items, continuation } => {
                 self.state.last_search = Some(query);
-                self.state.search_list.set_tracks(tracks);
+                self.state.search_list.set_search_items(items);
                 self.state.search_list.continuation = continuation.clone();
                 self.state.search_list.has_more = continuation.is_some();
                 self.state.status = format!("Results: {}", self.state.search_list.items.len());
@@ -829,9 +1138,9 @@ impl App {
                     self.state.search_focus = SearchFocus::Results;
                 }
             }
-            crate::app::events::NetworkEvent::SearchMoreResults { tracks, continuation } => {
+            crate::app::events::NetworkEvent::SearchMoreResults { items, continuation } => {
                 let count_before = self.state.search_list.items.len();
-                self.state.search_list.append_tracks(tracks);
+                self.state.search_list.append_search_items(items);
                 self.state.search_list.continuation = continuation.clone();
                 self.state.search_list.has_more = continuation.is_some();
                 let count_after = self.state.search_list.items.len();
@@ -877,6 +1186,14 @@ impl App {
                 } else {
                     self.state.status = format!("Library: {} tracks", self.state.library_list.items.len());
                 }
+            }
+            crate::app::events::NetworkEvent::PlaylistsLoaded { playlists } => {
+                self.state.playlist_list.set_playlists(playlists);
+                self.state.status = format!("Playlists: {} found", self.state.playlist_list.playlists.len());
+            }
+            crate::app::events::NetworkEvent::PlaylistTracksLoaded { _playlist_id: _, tracks } => {
+                self.state.playlist_view.set_tracks(tracks);
+                self.state.status = format!("Playlist: {} tracks", self.state.playlist_view.tracks.len());
             }
             crate::app::events::NetworkEvent::ResolvedStream { track, url } => {
                 self.state.now_playing = Some(track.title.clone());
@@ -1301,8 +1618,9 @@ fn sidebar_to_screen(idx: usize) -> Screen {
     match idx {
         0 => Screen::History,
         1 => Screen::Search,
-        2 => Screen::Library,
-        3 => Screen::Settings,
+        2 => Screen::Queue,
+        3 => Screen::Library,
+        4 => Screen::Settings,
         _ => Screen::Help,
     }
 }
@@ -1311,9 +1629,10 @@ fn screen_to_sidebar(screen: Screen) -> usize {
     match screen {
         Screen::History => 0,
         Screen::Search => 1,
-        Screen::Library => 2,
-        Screen::Settings => 3,
-        Screen::Help => 4,
+        Screen::Queue => 2,
+        Screen::Library => 3,
+        Screen::Settings => 4,
+        Screen::Help => 5,
     }
 }
 
@@ -1329,10 +1648,12 @@ impl StorageHandle {
         Storage::open(&self.path)
     }
 
+    #[allow(dead_code)]
     fn get_cached_search(&self, query: &str) -> anyhow::Result<Option<(String, i64)>> {
         self.open()?.get_cached_search(query)
     }
 
+    #[allow(dead_code)]
     fn cache_search(&self, query: &str, results_json: &str, now_unix: i64) -> anyhow::Result<()> {
         self.open()?.cache_search(query, results_json, now_unix)
     }

@@ -25,11 +25,13 @@ pub enum PlayerEvent {
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
     Error(String),
-    SearchResults { query: String, tracks: Vec<crate::ytm::models::Track>, continuation: Option<String> },
-    SearchMoreResults { tracks: Vec<crate::ytm::models::Track>, continuation: Option<String> },
+    SearchResults { query: String, items: Vec<crate::ytm::models::SearchItem>, continuation: Option<String> },
+    SearchMoreResults { items: Vec<crate::ytm::models::SearchItem>, continuation: Option<String> },
     HistoryResults { tracks: Vec<crate::ytm::models::Track> },
     HistoryAdded { track: crate::ytm::models::Track },
     LibraryResults { tracks: Vec<crate::ytm::models::Track> },
+    PlaylistsLoaded { playlists: Vec<crate::ytm::models::Playlist> },
+    PlaylistTracksLoaded { _playlist_id: String, tracks: Vec<crate::ytm::models::Track> },
     ResolvedStream { track: crate::ytm::models::Track, url: String },
     AudioDevices { devices: Vec<crate::app::state::AudioDevice> },
     LyricsLoaded { video_id: String, lyrics: crate::lyrics::ParsedLyrics },

@@ -3,6 +3,7 @@ mod config;
 mod input;
 mod lyrics;
 mod player;
+mod queue;
 mod storage;
 mod tui;
 mod ytm;
@@ -11,7 +12,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "kakariko", version, about = "YouTube Music TUI player (WIP)")]
+#[command(name = "void", version, about = "YouTube Music TUI player")]
 struct Cli {
     /// Override config file path.
     #[arg(long)]

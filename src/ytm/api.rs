@@ -1,5 +1,5 @@
 use crate::ytm::auth::AuthState;
-use crate::ytm::models::Track;
+use crate::ytm::models::{Playlist, SearchItem, Track};
 use anyhow::Context;
 use reqwest::header::{
     HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT,
@@ -13,6 +13,13 @@ use tokio::sync::OnceCell;
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub tracks: Vec<Track>,
+    pub continuation: Option<String>,
+}
+
+/// Search results with mixed types (tracks + playlists)
+#[derive(Debug, Clone)]
+pub struct SearchAllResult {
+    pub items: Vec<SearchItem>,
     pub continuation: Option<String>,
 }
 
@@ -144,6 +151,72 @@ impl YtmClient {
         Ok(v)
     }
 
+    /// Search for playlists only
+    pub async fn search_playlists_raw(&self, query: &str) -> anyhow::Result<serde_json::Value> {
+        let b = self.bootstrap().await?;
+
+        // Params for playlists filter: EgeKAQQoAEABagoQAxAEEAoQCRAF
+        let body = json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": b.client_version,
+                }
+            },
+            "query": query,
+            "params": "EgeKAQQoAEABagoQAxAEEAoQCRAF"
+        });
+
+        let v: serde_json::Value = self
+            .innertube_post("search", &b)
+            .json(&body)
+            .send()
+            .await
+            .context("send search playlists request")?
+            .error_for_status()
+            .context("search playlists http status")?
+            .json()
+            .await
+            .context("parse search playlists json")?;
+        Ok(v)
+    }
+
+    /// Search and return mixed results (tracks with pagination + playlists prepended)
+    /// This runs both a songs search (with pagination) and a playlists search,
+    /// merging the results so playlists appear first.
+    pub async fn search_all(&self, query: &str) -> anyhow::Result<SearchAllResult> {
+        // Run songs search (with pagination support) and playlists search in parallel
+        let (songs_result, playlists_result) = tokio::join!(
+            self.search_with_continuation(query),
+            self.search_playlists_raw(query)
+        );
+
+        let songs = songs_result?;
+        let playlists_json = playlists_result.ok();
+
+        // Extract playlists from playlist search
+        let playlists: Vec<SearchItem> = playlists_json
+            .as_ref()
+            .map(|v| extract_playlists_from_search(v))
+            .unwrap_or_default()
+            .into_iter()
+            .take(5) // Limit to top 5 playlists to not overwhelm results
+            .map(SearchItem::Playlist)
+            .collect();
+
+        // Convert tracks to SearchItems
+        let tracks: Vec<SearchItem> = songs.tracks.into_iter().map(SearchItem::Track).collect();
+
+        // Merge: playlists first, then tracks
+        let mut items = playlists;
+        items.extend(tracks);
+
+        Ok(SearchAllResult {
+            items,
+            continuation: songs.continuation,
+        })
+    }
+
     pub async fn browse_home_tracks(&self) -> anyhow::Result<Vec<Track>> {
         let v = self.browse_home_raw().await?;
         Ok(extract_tracks_generic(&v))
@@ -235,6 +308,66 @@ impl YtmClient {
             .context("parse browse liked music json")?;
 
         Ok(extract_tracks_generic(&v))
+    }
+
+    /// Get user's playlists (requires authentication)
+    #[allow(dead_code)]
+    pub async fn get_user_playlists(&self) -> anyhow::Result<Vec<Playlist>> {
+        let b = self.bootstrap().await?;
+
+        let body = json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": b.client_version,
+                }
+            },
+            "browseId": "FEmusic_library_privately_owned_playlists"
+        });
+
+        let v: serde_json::Value = self
+            .innertube_post("browse", &b)
+            .json(&body)
+            .send()
+            .await
+            .context("send browse playlists request")?
+            .error_for_status()
+            .context("browse playlists http status")?
+            .json()
+            .await
+            .context("parse browse playlists json")?;
+
+        Ok(extract_playlists(&v))
+    }
+
+    /// Get user's saved albums (requires authentication)
+    #[allow(dead_code)]
+    pub async fn get_user_albums(&self) -> anyhow::Result<Vec<Playlist>> {
+        let b = self.bootstrap().await?;
+
+        let body = json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": b.client_version,
+                }
+            },
+            "browseId": "FEmusic_library_albums"
+        });
+
+        let v: serde_json::Value = self
+            .innertube_post("browse", &b)
+            .json(&body)
+            .send()
+            .await
+            .context("send browse albums request")?
+            .error_for_status()
+            .context("browse albums http status")?
+            .json()
+            .await
+            .context("parse browse albums json")?;
+
+        Ok(extract_playlists(&v))
     }
 
     /// Get radio/automix tracks based on a seed video ID.
@@ -665,5 +798,336 @@ where
         _ => {}
     }
     false
+}
+
+/// Extract playlists from search response (playlist-filtered)
+fn extract_playlists_from_search(v: &serde_json::Value) -> Vec<Playlist> {
+    let mut out = Vec::new();
+    scan_playlists(v, &mut |node| {
+        // In search results, playlists appear as musicResponsiveListItemRenderer
+        if let Some(r) = node.get("musicResponsiveListItemRenderer") {
+            // Check if this is a playlist (has browseId starting with VL or PL)
+            if let Some(browse_id) = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(|x| x.as_str())
+            {
+                if browse_id.starts_with("VL") || browse_id.starts_with("PL") {
+                    let playlist_id = browse_id.strip_prefix("VL").unwrap_or(browse_id).to_string();
+
+                    let title = r
+                        .pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("Unknown playlist")
+                        .to_string();
+
+                    // Get author from second flex column
+                    let author = r
+                        .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+
+                    // Try to get track count from subtitle runs
+                    let track_count = r
+                        .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs")
+                        .and_then(|x| x.as_array())
+                        .and_then(|runs| {
+                            runs.iter()
+                                .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                                .find_map(|text| {
+                                    // Look for patterns like "45 songs" or "45 tracks"
+                                    if text.contains("song") || text.contains("track") {
+                                        text.split_whitespace()
+                                            .next()
+                                            .and_then(|n| n.parse::<u32>().ok())
+                                    } else {
+                                        None
+                                    }
+                                })
+                        });
+
+                    return Some(Playlist {
+                        id: playlist_id,
+                        title,
+                        author,
+                        track_count,
+                        thumbnail_url: None,
+                    });
+                }
+            }
+        }
+
+        // Also check musicTwoRowItemRenderer
+        if let Some(r) = node.get("musicTwoRowItemRenderer") {
+            if let Some(browse_id) = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(|x| x.as_str())
+            {
+                if browse_id.starts_with("VL") || browse_id.starts_with("PL") {
+                    let playlist_id = browse_id.strip_prefix("VL").unwrap_or(browse_id).to_string();
+
+                    let title = r
+                        .pointer("/title/runs/0/text")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("Unknown playlist")
+                        .to_string();
+
+                    let author = r
+                        .pointer("/subtitle/runs/0/text")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+
+                    return Some(Playlist {
+                        id: playlist_id,
+                        title,
+                        author,
+                        track_count: None,
+                        thumbnail_url: None,
+                    });
+                }
+            }
+        }
+
+        None
+    }, &mut out);
+    out
+}
+
+/// Extract playlists from library browse response
+fn extract_playlists(v: &serde_json::Value) -> Vec<Playlist> {
+    let mut out = Vec::new();
+    scan_playlists(v, &mut |node| {
+        // Look for musicTwoRowItemRenderer which is used for playlists/albums in library
+        if let Some(r) = node.get("musicTwoRowItemRenderer") {
+            let playlist_id = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(|x| x.as_str())
+                // Remove "VL" prefix if present
+                .map(|s| s.strip_prefix("VL").unwrap_or(s).to_string())?;
+
+            let title = r
+                .pointer("/title/runs/0/text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("Unknown playlist")
+                .to_string();
+
+            let author = r
+                .pointer("/subtitle/runs/0/text")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+
+            // Try to extract track count from subtitle
+            let track_count = r
+                .pointer("/subtitle/runs")
+                .and_then(|x| x.as_array())
+                .and_then(|runs| {
+                    runs.iter()
+                        .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                        .find_map(|text| {
+                            // Look for patterns like "45 songs" or "45 tracks"
+                            let parts: Vec<&str> = text.split_whitespace().collect();
+                            if parts.len() >= 2
+                                && (parts[1].contains("song") || parts[1].contains("track"))
+                            {
+                                parts[0].parse::<u32>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                });
+
+            let thumbnail_url = r
+                .pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails/0/url")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+
+            return Some(Playlist {
+                id: playlist_id,
+                title,
+                author,
+                track_count,
+                thumbnail_url,
+            });
+        }
+
+        // Also try musicResponsiveListItemRenderer for some playlist views
+        if let Some(r) = node.get("musicResponsiveListItemRenderer") {
+            let playlist_id = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(|x| x.as_str())
+                .map(|s| s.strip_prefix("VL").unwrap_or(s).to_string())?;
+
+            let title = r
+                .pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("Unknown playlist")
+                .to_string();
+
+            let author = r
+                .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+
+            return Some(Playlist {
+                id: playlist_id,
+                title,
+                author,
+                track_count: None,
+                thumbnail_url: None,
+            });
+        }
+
+        None
+    }, &mut out);
+    out
+}
+
+fn scan_playlists<F>(v: &serde_json::Value, f: &mut F, out: &mut Vec<Playlist>)
+where
+    F: FnMut(&serde_json::Value) -> Option<Playlist>,
+{
+    if let Some(p) = f(v) {
+        out.push(p);
+    }
+    match v {
+        serde_json::Value::Array(a) => {
+            for x in a {
+                scan_playlists(x, f, out);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for (_, x) in o {
+                scan_playlists(x, f, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract search items (tracks and playlists) from search response
+#[allow(dead_code)]
+fn extract_search_items(v: &serde_json::Value) -> Vec<SearchItem> {
+    let mut out = Vec::new();
+    scan_search_items(v, &mut |node| {
+        // Try to extract as a track (musicResponsiveListItemRenderer with video_id)
+        if let Some(r) = node.get("musicResponsiveListItemRenderer") {
+            // Check if this is a track (has videoId in overlay or playlistItemData)
+            if let Some(video_id) = extract_video_id_from_item(r) {
+                let title = r
+                    .pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("Unknown title")
+                    .to_string();
+
+                let artists = r
+                    .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs")
+                    .and_then(|x| x.as_array())
+                    .map(|runs| {
+                        runs.iter()
+                            .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                            .filter(|t| *t != " • " && *t != " & ")
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                return Some(SearchItem::Track(Track {
+                    video_id,
+                    title,
+                    artists,
+                    album: None,
+                    duration_seconds: None,
+                }));
+            }
+
+            // Check if this is a playlist (has browseId starting with VL or is a playlist type)
+            if let Some(browse_id) = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(|x| x.as_str())
+            {
+                // Playlists have browseId starting with "VL" or have specific page type
+                if browse_id.starts_with("VL") || browse_id.starts_with("PL") {
+                    let playlist_id = browse_id.strip_prefix("VL").unwrap_or(browse_id).to_string();
+
+                    let title = r
+                        .pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("Unknown playlist")
+                        .to_string();
+
+                    let author = r
+                        .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+
+                    return Some(SearchItem::Playlist(Playlist {
+                        id: playlist_id,
+                        title,
+                        author,
+                        track_count: None,
+                        thumbnail_url: None,
+                    }));
+                }
+            }
+        }
+
+        // Try musicTwoRowItemRenderer (used for some playlist/album results)
+        if let Some(r) = node.get("musicTwoRowItemRenderer") {
+            if let Some(browse_id) = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(|x| x.as_str())
+            {
+                if browse_id.starts_with("VL") || browse_id.starts_with("PL") {
+                    let playlist_id = browse_id.strip_prefix("VL").unwrap_or(browse_id).to_string();
+
+                    let title = r
+                        .pointer("/title/runs/0/text")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("Unknown playlist")
+                        .to_string();
+
+                    let author = r
+                        .pointer("/subtitle/runs/0/text")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+
+                    return Some(SearchItem::Playlist(Playlist {
+                        id: playlist_id,
+                        title,
+                        author,
+                        track_count: None,
+                        thumbnail_url: None,
+                    }));
+                }
+            }
+        }
+
+        None
+    }, &mut out);
+    out
+}
+
+#[allow(dead_code)]
+fn scan_search_items<F>(v: &serde_json::Value, f: &mut F, out: &mut Vec<SearchItem>)
+where
+    F: FnMut(&serde_json::Value) -> Option<SearchItem>,
+{
+    if let Some(item) = f(v) {
+        out.push(item);
+        // Don't recurse into this node since we already extracted an item
+        return;
+    }
+    match v {
+        serde_json::Value::Array(a) => {
+            for x in a {
+                scan_search_items(x, f, out);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for (_, x) in o {
+                scan_search_items(x, f, out);
+            }
+        }
+        _ => {}
+    }
 }
 

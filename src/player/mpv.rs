@@ -24,7 +24,7 @@ impl MpvHandle {
         audio_device: Option<&str>,
         log_file: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
-        let socket_path = std::env::temp_dir().join("kakariko-mpv.sock");
+        let socket_path = std::env::temp_dir().join("void-mpv.sock");
         let _ = std::fs::remove_file(&socket_path);
 
         let mut cmd = Command::new("mpv");

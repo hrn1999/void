@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS lyrics_cache (
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn cache_search(&self, query: &str, results_json: &str, now_unix: i64) -> anyhow::Result<()> {
         self.conn
             .execute(
@@ -88,6 +89,7 @@ ON CONFLICT(query) DO UPDATE SET
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_cached_search(&self, query: &str) -> anyhow::Result<Option<(String, i64)>> {
         let mut stmt = self
             .conn
